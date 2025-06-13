@@ -1,0 +1,215 @@
+library(adegenet)
+library(tidyverse)
+library(scales)
+
+# === 1. Читаем .gen файл ===
+genind_obj <- read.genepop("final_fixed_alleles.gen", ncode = 3)
+df <- genind2df(genind_obj, sep = "")
+
+# === 2. Присваиваем популяции ===
+pop_numbers <- as.numeric(pop(genind_obj))
+pop_names <- c(
+  "Alaska_DAV", "Alaska_DIMO", "Alaska_KOD", "Alaska_OLAN", "Alaska_ONG", "Alaska_MCH",
+  "Alaska_NAP", "Alaska_NUSH", "Alaska_SAP", "Alaska_UCH", "Alaska_DENA",
+  "Canada_RTC_Boreal_Ft.Nelson", "Canada_RTC_Boreal_Caribou_Mts_Alberta",
+  "Canada_RTC_Boreal_Red_Earth", "Canada_RTC_Boreal_WSAR", "Canada_RTC_Boreal_CLAWR",
+  "Canada_RTC_SSM_Atlin", "Canada_RTC_SSM_Horseranch", "Canada_RTC_SSM_Level_Kawdy",
+  "Canada_RTC_SSM_Rabbit", "Canada_RTC_SSM_Muskwa", "Canada_RTC_SSM_Frog",
+  "Canada_RTC_SSM_Tsenaglode", "Canada_RTC_SSM_Pink_Mountain", "Canada_RTC_SSM_Wolverine",
+  "Canada_RTC_SSM_Spatsizi", "Canada_RTC_SSM_Tweedsmuir", "Canada_RTC_SSM_Itchas",
+  "Canada_RTC_SSM_Graham", "Canada_RTC_SSM_kennedy", "Canada_RTC_SSM_quintette",
+  "Canada_RTC_SSM_burnt", "Canada_RTC_SSM_Jasper", "Canada_RTC_DSM_Hart",
+  "Canada_RTC_DSM_N_Cariboo_Mtn_PG", "Canada_RTC_DSM_Barkerville", "Canada_RTC_DSM_WELLS_GRAY",
+  "Canada_RTC_DSM_ALLEN", "Canada_RTC_DSM_GROUNDHOG", "Canada_RTC_DSM_Kinbasket",
+  "Canada_RTC_DSM_Columbia_North", "Canada_RTC_DSM_FRISBY_QUEEST", "Canada_RTC_DSM_Columbia_South",
+  "Canada_RTC_DSM_Central_Selkirk", "Canada_RTC_DSM_Duncan", "Canada_RTC_DSM_Purcell",
+  "Canada_RTC_DSM_South_Selkirk", "Canada_RTP_Bathurst", "Russia_Nen", "Russia_Todzh",
+  "Russia_Tofal", "Russia_Evensk", "Russia_Evenki", "Russia_Chuk", "Russia_Wild.Taimyr",
+  "Russia_Wild.Tura", "Russia_Wild.Murm", "Russia_Wild.Amur", "Russia_Wild.Magad",
+  "Russia_Wild.Yakut", "Russia_Wild.Chuk", "Russia_Nenets.murmansk", "Russia_Wild.magadan",
+  "Russia_Chukchi", "Russia_Nenets.Taimyr", "Russia_Nenets.Yamal",
+  "Russia_Evenki.calves.Surinda", "Russia_Wild.wrangel", "Russia_tofal"
+)
+df$Population <- pop_names[pop_numbers]
+
+# === 3. Добавляем регион ===
+df <- df %>%
+  mutate(Region = case_when(
+    str_detect(Population, "Alaska") ~ "Alaska",
+    str_detect(Population, "Canada") ~ "Canada",
+    str_detect(Population, "Russia") ~ "Russia"
+  ))
+
+# === 4. Подготовка длинного формата ===
+df_long <- df %>%
+  pivot_longer(cols = -c(Population, Region), names_to = "Locus", values_to = "AllelePair") %>%
+  mutate(
+    Allele1 = substr(AllelePair, 1, 3),
+    Allele2 = substr(AllelePair, 4, 6)
+  ) %>%
+  select(-AllelePair) %>%
+  pivot_longer(cols = c(Allele1, Allele2), names_to = "AllelePos", values_to = "Allele") %>%
+  mutate(
+    Allele = ifelse(Allele %in% c("000", "666"), NA, Allele)
+  ) %>%
+  filter(!is.na(Allele))
+
+# === 5. Считаем частоты аллелей ===
+allele_freqs <- df_long %>%
+  group_by(Locus, Population, Region, Allele) %>%
+  summarise(Frequency = n(), .groups = "drop")
+
+alleles_long <- df_long %>% distinct(Locus, Allele)
+
+## heatmap
+
+plot_heatmap_shift <- function(locus_name, shift_alaska = 0, shift_canada = 0, max_freq_scale = 10, buffer = 5) {
+  df_locus <- allele_freqs %>%
+    filter(Locus == locus_name) %>%
+    mutate(Allele_num = as.numeric(Allele)) %>%
+    mutate(Allele_num = case_when(
+      Region == "Alaska" ~ Allele_num + shift_alaska,
+      Region == "Canada" ~ Allele_num + shift_canada,
+      TRUE ~ Allele_num
+    ))
+
+  # Вычисляем диапазон уже после сдвига
+  min_allele <- min(df_locus$Allele_num, na.rm = TRUE) - buffer
+  max_allele <- max(df_locus$Allele_num, na.rm = TRUE) + buffer
+  full_allele_range <- min_allele:max_allele
+  full_allele_range_chr <- as.character(full_allele_range)
+
+  # Отбрасываем аллели вне диапазона
+  df_locus <- df_locus %>%
+    filter(Allele_num >= min_allele, Allele_num <= max_allele) %>%
+    mutate(Allele = as.character(Allele_num))
+
+  # Готовим сетку
+  full_grid <- expand.grid(
+    Population = unique(df_locus$Population),
+    Allele = full_allele_range_chr,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(df_locus %>% select(Population, Region) %>% distinct(), by = "Population")
+
+  df_plot <- full_grid %>%
+    left_join(df_locus, by = c("Population", "Allele", "Region")) %>%
+    mutate(Frequency = replace_na(Frequency, 0))
+
+  threshold_for_white <- max_freq_scale * 0.5
+
+  # Упорядочиваем регионы
+  alaska_pops <- unique(df_plot$Population[df_plot$Region == "Alaska"])
+  russia_pops <- unique(df_plot$Population[df_plot$Region == "Russia"])
+  canada_pops <- unique(df_plot$Population[df_plot$Region == "Canada"])
+  population_order <- c(alaska_pops, russia_pops, canada_pops)
+
+  ggplot(df_plot, aes(x = factor(Population, levels = population_order),
+                      y = factor(Allele, levels = full_allele_range_chr), fill = Frequency)) +
+    geom_tile(color = "grey95") +
+    geom_text(aes(
+      label = ifelse(Frequency > 0, Frequency, ""),
+      color = Frequency > threshold_for_white
+    ), size = 2) +
+    scale_color_manual(values = c("black", "white")) +
+    scale_fill_gradientn(
+      colours = c("white", "yellow", "orange", "red", "darkred"),
+      limits = c(0, max_freq_scale),
+      oob = scales::squish
+    ) +
+    geom_vline(xintercept = length(alaska_pops) + 0.5, linetype = "dotted", color = "black", linewidth = 0.3) +
+    geom_vline(xintercept = length(alaska_pops) + length(russia_pops) + 0.5, linetype = "dotted", color = "black", linewidth = 0.3) +
+    labs(
+      title = paste("Heatmap - Locus", locus_name, "- Shift: Alaska", shift_alaska, "Canada", shift_canada),
+      x = "Population", y = "Allele", fill = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+      axis.text.y = element_text(size = 5),
+      plot.title = element_text(size = 11)
+    ) +
+    guides(color = "none")
+}
+
+## correlation
+
+correlation_scan <- function(locus_name, region1 = "Russia", region2 = "Alaska", from_lag = -20, to_lag = 20) {
+  df_locus <- allele_freqs %>% filter(Locus == locus_name)
+
+  get_freq_vector <- function(region) {
+    df_locus %>%
+      filter(Region == region) %>%
+      group_by(Allele) %>%
+      summarise(Frequency = sum(Frequency), .groups = "drop") %>%
+      mutate(Allele = as.numeric(Allele)) %>%
+      arrange(Allele)
+  }
+
+  vec1_df <- get_freq_vector(region1)
+  vec2_df <- get_freq_vector(region2)
+
+  all_alleles <- sort(unique(c(vec1_df$Allele, vec2_df$Allele)))
+  full_range <- min(all_alleles):max(all_alleles)
+
+  vec1 <- rep(0, length(full_range))
+  vec2 <- rep(0, length(full_range))
+  names(vec1) <- names(vec2) <- full_range
+
+  vec1[as.character(vec1_df$Allele)] <- vec1_df$Frequency
+  vec2[as.character(vec2_df$Allele)] <- vec2_df$Frequency
+
+  cor_results <- data.frame(lag = integer(), correlation = numeric())
+
+  for (lag in from_lag:to_lag) {
+    if (lag < 0) {
+      x <- vec1[1:(length(vec1) + lag)]
+      y <- vec2[(1 - lag):length(vec2)]
+    } else if (lag > 0) {
+      x <- vec1[(1 + lag):length(vec1)]
+      y <- vec2[1:(length(vec2) - lag)]
+    } else {
+      x <- vec1
+      y <- vec2
+    }
+
+    if (length(x) > 1 && length(x) == length(y)) {
+      cor_val <- suppressWarnings(cor(x, y, method = "pearson"))
+    } else {
+      cor_val <- NA
+    }
+
+    cor_results <- rbind(cor_results, data.frame(lag = lag, correlation = cor_val))
+  }
+
+  best_row <- cor_results[which.max(cor_results$correlation), ]
+  best_lag <- best_row$lag
+  best_cor <- round(best_row$correlation, 3)
+
+  y_max <- max(cor_results$correlation, na.rm = TRUE)
+  y_min <- min(cor_results$correlation, na.rm = TRUE)
+  label_y <- if (best_cor - 0.05 > y_min) best_cor - 0.05 else best_cor + 0.05
+
+  ggplot(cor_results, aes(x = lag, y = correlation)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = best_lag, linetype = "dashed", color = "red") +
+  annotate("label",
+           x = best_lag,
+           y = max(cor_results$correlation, na.rm = TRUE) * 1.1,
+           label = paste0("Max: ", best_cor, "\nLag: ", best_lag),
+           size = 3.5, fill = "white", color = "red", label.size = 0.4, fontface = "bold") +
+  ylim(min(cor_results$correlation, na.rm = TRUE),
+       max(cor_results$correlation, na.rm = TRUE) * 1.1) +
+  labs(
+    title = paste("Correlation scan —", region1, "vs", region2, "|", locus_name),
+    x = "Lag (shift)", y = "Pearson correlation"
+  ) +
+  theme_minimal()
+}
+
+## execution
+
+correlation_scan("", region1 = "Russia", region2 = "", from_lag = 0, to_lag = 0)
+
+plot_heatmap_shift("OHEQ", shift_alaska = 0, shift_canada = 0, buffer = 5)
